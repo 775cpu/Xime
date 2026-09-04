@@ -274,6 +274,20 @@ def set_remote(git_bin: str, remote_url: str):
         run_shell(git_bin, ["remote", "add", "origin", remote_url])
 
 
+def parse_github_subdirectory_url(remote_url: str) -> tuple[str, str | None, str | None]:
+    """Return (repository URL, branch, subdirectory) for a GitHub web URL."""
+    parsed = urlparse(remote_url)
+    if parsed.scheme not in ("http", "https") or parsed.netloc.lower() not in ("github.com", "www.github.com"):
+        return remote_url, None, None
+    parts = [part for part in parsed.path.strip("/").split("/") if part]
+    if len(parts) < 5 or parts[2] not in ("blob", "tree"):
+        return remote_url, None, None
+    owner, repository, _, branch, *subdirectory = parts
+    repository = repository.removesuffix(".git")
+    repository_url = urlunparse(parsed._replace(path=f"/{owner}/{repository}.git", params="", query="", fragment=""))
+    return repository_url, branch, "/".join(subdirectory)
+
+
 def scan_large_files(repo_root: Path, threshold: int) -> set[str]:
     large_files = set()
     skip_dirs = {".git", "build", "dist", "__pycache__"}
@@ -312,25 +326,80 @@ def clean_and_apply_lfs(git_bin: str, repo_root: Path, large_patterns: set[str])
     logger.info(f".gitattributes 更新完成，LFS追踪总数: {len(lfs_lines)}")
 
 
+def run_network_retry(git_bin: str, cmd_args: list[str], operation: str, remote_url: str,
+                      branch: str, retry_count: int = 10, retry_seconds: int = 5,
+                      is_debug: bool = False, cwd: Path = None):
+    net_kw = [
+        "could not read from remote repository",
+        "ssh: connect to host",
+        "connection timed out",
+        "the remote end hung up unexpectedly",
+        "fatal: unable to access",
+        "failed to connect to",
+        "network is unreachable",
+        "remote: fatal:",
+        "dial tcp",
+        "connectex",
+        "a connection attempt failed",
+        "connected party did not properly respond",
+        "connected host has failed to respond",
+        "curl 28",
+        "rpc failed",
+        "expected flush after ref listing",
+        "connection was reset",
+    ]
+    auth_kw = [
+        "http 401",
+        "http 403",
+        "fatal: authentication failed",
+        "permission denied (publickey)",
+    ]
+    for attempt in range(1, retry_count + 1):
+        logger.info(f"===== {operation} {redact_url(remote_url)} {branch} "
+                    f"(尝试 {attempt}/{retry_count}) 间隔 {retry_seconds}s =====")
+        extra_env = {}
+        if is_debug or attempt > 1:
+            extra_env.update({"GIT_CURL_VERBOSE": "1", "GIT_TRACE": "1"})
+            if attempt > 1:
+                logger.info("🔍 启用详细连接日志")
+        try:
+            result = run_shell(git_bin, cmd_args, realtime=True, extra_env=extra_env, cwd=cwd)
+            if result.returncode == 0:
+                return result
+            output = (result.stdout or "").lower()
+            is_net = any(keyword in output for keyword in net_kw)
+            is_auth = any(keyword in output for keyword in auth_kw)
+            if is_net and not is_auth:
+                logger.warning(f"⚠️ 网络错误，稍后重试 (返回码: {result.returncode})")
+            else:
+                logger.error(f"❌ {operation}失败 (返回码: {result.returncode})")
+                sys.exit(1)
+        except Exception as exc:
+            logger.warning(f"⚠️ 异常: {repr(exc)}，重试")
+        if attempt < retry_count:
+            time.sleep(retry_seconds)
+        else:
+            logger.error(f"❌ {operation}达到最大重试次数 {retry_count}")
+            sys.exit(1)
+
+
 def git_pull(git_bin: str, branch: str, extra_args: list[str], remote_url: str = "",
-             connect_timeout: int = 45, low_speed_limit: int = 1000, low_speed_time: int = 30):
-    ''' #TODO 网络重试逻辑只在 git_push 内部实现
-git pull没有重试循环，网络抖动直接退出。 应该封装通用重试逻辑  '''
-    logger.info(f"===== 开始执行 git pull {redact_url(remote_url)} {branch} =====")
+             connect_timeout: int = 45, low_speed_limit: int = 1000, low_speed_time: int = 30,
+             retry_count: int = 10, retry_seconds: int = 5):
     git_config_args = [
         "-c", f"http.connectTimeout={connect_timeout}",
         "-c", f"http.lowSpeedLimit={low_speed_limit}",
         "-c", f"http.lowSpeedTime={low_speed_time}"
     ]
-    if run_shell(git_bin, git_config_args + ["pull", "--progress"] + extra_args + [remote_url, branch],
-                 realtime=True).returncode != 0:
-        logger.error("git pull 失败！")
-        sys.exit(1)
+    pull_args = git_config_args + ["pull", "--progress"] + extra_args + [remote_url, branch]
+    run_network_retry(git_bin, pull_args, "拉取", remote_url, branch, retry_count, retry_seconds,
+                      logger.getEffectiveLevel() <= logging.DEBUG)
     logger.info("===== 开始执行 git lfs pull =====")
     run_shell(git_bin, ["lfs", "pull"], realtime=True)
 
 
 def git_clone(git_bin: str, branch: str, remote_url: str, extra_args: list[str],
+              sparse_path: str | None = None,
               connect_timeout: int = 45, low_speed_limit: int = 1000,
               low_speed_time: int = 30):
     """Clone or resume a repository and download its LFS objects."""
@@ -344,6 +413,8 @@ def git_clone(git_bin: str, branch: str, remote_url: str, extra_args: list[str],
         "-c", f"http.lowSpeedTime={low_speed_time}"
     ]
     clone_args = git_config_args + ["clone", "--progress"]
+    if sparse_path:
+        clone_args.extend(["--filter=blob:none", "--sparse"])
     if branch and "--branch" not in extra_args and "-b" not in extra_args:
         clone_args.extend(["--branch", branch])
     clone_options = list(extra_args)
@@ -365,15 +436,32 @@ def git_clone(git_bin: str, branch: str, remote_url: str, extra_args: list[str],
                 break
     clone_args.extend(clone_options + [remote_url])
     if destination is None:
-        repo_name = remote_url.rstrip("/").rsplit("/", 1)[-1]
-        if ":" in repo_name and not remote_url.startswith(("http://", "https://")):
-            repo_name = repo_name.rsplit(":", 1)[-1]
-        destination = Path(repo_name.removesuffix(".git"))
+        if sparse_path:
+            destination = Path(sparse_path.rstrip("/").rsplit("/", 1)[-1])
+        else:
+            repo_name = remote_url.rstrip("/").rsplit("/", 1)[-1]
+            if ":" in repo_name and not remote_url.startswith(("http://", "https://")):
+                repo_name = repo_name.rsplit(":", 1)[-1]
+            destination = Path(repo_name.removesuffix(".git"))
     clone_args.append(str(destination))
     if not destination.is_absolute():
         destination = Path.cwd() / destination
 
-    if destination.exists() and any(destination.iterdir()):
+    if destination.exists() and sparse_path and (destination / ".git").exists():
+        existing_remote = subprocess.run(
+            [git_bin, "remote", "get-url", "origin"],
+            cwd=destination,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if existing_remote.rstrip("/").removesuffix(".git") != remote_url.rstrip("/").removesuffix(".git"):
+            logger.error(f"目标目录已是其他 Git 仓库，无法复用: {destination}")
+            sys.exit(1)
+        logger.info(f"===== 复用已有仓库，仅检出项目子目录: {destination / sparse_path} =====")
+        if run_shell(git_bin, ["sparse-checkout", "set", "--cone", sparse_path], cwd=destination).returncode != 0:
+            logger.error("设置 sparse-checkout 子目录失败！")
+            sys.exit(1)
+    elif destination.exists() and any(destination.iterdir()):
         if not (destination / ".git").exists():
             logger.error(f"目标目录已存在且不是 Git 仓库，拒绝覆盖: {destination}")
             sys.exit(1)
@@ -400,6 +488,10 @@ def git_clone(git_bin: str, branch: str, remote_url: str, extra_args: list[str],
         logger.info(f"===== 开始执行 git clone {redact_url(remote_url)} =====")
         if run_shell(git_bin, clone_args, realtime=True, extra_env={"GIT_LFS_SKIP_SMUDGE": "1"}).returncode != 0:
             logger.error("git clone 失败！")
+            sys.exit(1)
+
+        if sparse_path and run_shell(git_bin, ["sparse-checkout", "set", "--cone", sparse_path], cwd=destination).returncode != 0:
+            logger.error("设置 sparse-checkout 子目录失败！")
             sys.exit(1)
 
     attr_path = destination / ".gitattributes"
@@ -540,61 +632,13 @@ def git_push(git_bin: str, branch: str, repo_root: Path, extra_args: list[str],
     ]
     cmd_args = git_config_args + ["push", "-v", "--progress"] + extra_args + [remote_url, branch]
 
-    for attempt in range(1, retry_count + 1):
-        logger.info(f"===== 推送 {redact_url(remote_url)} {branch} (尝试 {attempt}/{retry_count}) 间隔 {retry_seconds}s =====")
-        extra_env = {}
-        if is_debug or attempt > 1:
-            extra_env["GIT_CURL_VERBOSE"] = "1"
-            extra_env["GIT_TRACE"] = "1"
-            if attempt > 1:
-                logger.info("🔍 启用详细连接日志")
-        try:
-            push_res = run_shell(git_bin, cmd_args, realtime=True, extra_env=extra_env)
-            if push_res.returncode == 0:
-                if EmptyAfterPush:
-                    with open(repo_root / 'ReadMe.md', 'wb') as f:
-                        f.write(b'')
-                    logger.info(f"EmptyAfterPush 成功 {stime()}")
-                logger.info(f"✅ 推送成功 {stime()}")
-                break
-            else:
-                eout = push_res.stdout or ""
-                eout_l = eout.lower()
-                net_kw = [
-                    "could not read from remote repository",
-                    "ssh: connect to host",
-                    "connection timed out",
-                    "the remote end hung up unexpectedly",
-                    "fatal: unable to access",
-                    "failed to connect to",
-                    "network is unreachable",
-                    "remote: fatal:",
-                    "dial tcp",
-                    "connectex",
-                    "a connection attempt failed",
-                    "connected party did not properly respond",
-                    "connected host has failed to respond"
-                ]
-                auth_kw = [
-                    "http 401",
-                    "http 403",
-                    "fatal: authentication failed",
-                    "permission denied (publickey)"
-                ]
-                is_net = any(k in eout_l for k in net_kw)
-                is_auth = any(k in eout_l for k in auth_kw)
-                if is_net and not is_auth:
-                    logger.warning(f"⚠️ 网络错误，稍后重试 (返回码: {push_res.returncode})")
-                else:
-                    logger.error(f"❌ 推送失败 (返回码: {push_res.returncode})")
-                    sys.exit(1)
-        except Exception as e:
-            logger.warning(f"⚠️ 异常: {repr(e)}，重试")
-        if attempt < retry_count:
-            time.sleep(retry_seconds)
-        else:
-            logger.error(f"❌ 达到最大重试次数 {retry_count}")
-            sys.exit(1)
+    run_network_retry(git_bin, cmd_args, "推送", remote_url, branch,
+                      retry_count, retry_seconds, is_debug)
+    if EmptyAfterPush:
+        with open(repo_root / 'ReadMe.md', 'wb') as f:
+            f.write(b'')
+        logger.info(f"EmptyAfterPush 成功 {stime()}")
+    logger.info(f"✅ 推送成功 {stime()}")
 
 
 def git_list_big(git_bin: str, threshold_bytes: int) -> list[tuple[int, str, str]]:
@@ -707,6 +751,12 @@ def main():
     git_exe = find_git(args.git)
     repo_root = Path.cwd()
     remote_url = args.remote or get_origin_url(git_exe) or get_branch_tracking_url(git_exe, args.branch)
+    clone_branch = args.branch
+    clone_subdirectory = None
+    if args.mode == "clone" and remote_url:
+        remote_url, url_branch, clone_subdirectory = parse_github_subdirectory_url(remote_url)
+        if url_branch:
+            clone_branch = url_branch
     if not remote_url and args.mode not in ("list-big", "listbig", "remove-big", "undo"):
         logger.critical("未提供远程仓库地址，且未找到 origin/tracking 配置。")
         sys.exit(1)
@@ -717,7 +767,7 @@ def main():
         logger.info(f"文件限制: {threshold_bytes / 1024 / 1024:.2f} MB ({threshold_bytes} 字节)")
     if remote_url:
         logger.info(f"远程地址: {redact_url(remote_url)}")
-    logger.info(f"分支: {args.branch}")
+    logger.info(f"分支: {clone_branch if args.mode == 'clone' else args.branch}")
     logger.info(f"连接超时: {args.connect_timeout}s | 低速阈值: {args.low_speed_limit}B/s | 低速超时: {args.low_speed_time}s")
 
     try:
@@ -727,7 +777,7 @@ def main():
             logger.info("✅ 当前仓库用户配置完成！")
             return
         if args.mode == "clone":
-            git_clone(git_exe, args.branch, remote_url, extra,
+            git_clone(git_exe, clone_branch, remote_url, extra, clone_subdirectory,
                       connect_timeout=args.connect_timeout,
                       low_speed_limit=args.low_speed_limit,
                       low_speed_time=args.low_speed_time)
@@ -776,6 +826,7 @@ def main():
             set_remote(git_exe, remote_url)
         if args.mode == "pull":
             git_pull(git_exe, args.branch, extra, remote_url,
+                     retry_count=args.retry,
                      connect_timeout=args.connect_timeout,
                      low_speed_limit=args.low_speed_limit,
                      low_speed_time=args.low_speed_time)
