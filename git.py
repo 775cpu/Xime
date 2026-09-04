@@ -252,10 +252,58 @@ def install_lfs() -> bool:
     return False
 
 
-def init_lfs(git_bin: str) -> bool:
-    logger.info("执行 git lfs install 初始化...")
-    if run_shell(git_bin, ["lfs", "install"]).returncode != 0:
+def init_lfs(git_bin: str, repo_root: Path = None) -> bool:
+    logger.info("执行 git lfs install 初始化仓库过滤器...")
+    lfs_args = ["lfs", "install"]
+    if repo_root:
+        lfs_args.append("--local")
+    if run_shell(git_bin, lfs_args, cwd=repo_root).returncode != 0:
         logger.error("Git LFS 初始化失败！")
+        return False
+    return True
+
+
+def renormalize_lfs(git_bin: str, repo_root: Path) -> bool:
+    """Re-clean tracked files after adding or changing LFS attributes."""
+    logger.info("执行 Git LFS 重新规范化，确保已跟踪大文件转换为 LFS 指针...")
+    if run_shell(git_bin, ["add", "--renormalize", "."], cwd=repo_root).returncode != 0:
+        logger.error("Git LFS 重新规范化失败！")
+        return False
+    return True
+
+def verify_staged_lfs_files(git_bin: str, repo_root: Path) -> bool:
+    """Fail before push if a staged LFS-matched file is still a large blob."""
+    attrs_result = subprocess.run(
+        [git_bin, "diff", "--cached", "--name-only"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    if attrs_result.returncode != 0:
+        return True
+    invalid_files = []
+    for path in (line.strip() for line in attrs_result.stdout.splitlines() if line.strip()):
+        attr_result = subprocess.run(
+            [git_bin, "check-attr", "filter", "--", path],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+        if not attr_result.stdout.rstrip().endswith(": lfs"):
+            continue
+        blob_result = subprocess.run(
+            [git_bin, "cat-file", "blob", f":{path}"],
+            cwd=repo_root,
+            capture_output=True,
+        )
+        if blob_result.returncode == 0 and not blob_result.stdout.startswith(
+                b"version https://git-lfs.github.com/spec/v1\n"):
+            invalid_files.append(path)
+    if invalid_files:
+        logger.error("以下暂存文件匹配 LFS 规则，但仍是普通 Git Blob: "
+                     f"{invalid_files}")
+        logger.error("已阻止提交，请执行 git lfs install --local，"
+                     "再执行 git add --renormalize . && git add -A。")
         return False
     return True
 
@@ -312,7 +360,7 @@ def parse_github_subdirectory_url(remote_url: str) -> tuple[str, str | None, str
 
 def scan_large_files(repo_root: Path, threshold: int) -> set[str]:
     large_files = set()
-    skip_dirs = {".git", "build", "dist", "__pycache__"}
+    skip_dirs = {".git", "dist", "__pycache__"}
     for path in repo_root.rglob("*"):
         if any(part in skip_dirs for part in path.parts) or not path.is_file():
             continue
@@ -376,6 +424,11 @@ def run_network_retry(git_bin: str, cmd_args: list[str], operation: str, remote_
         "fatal: authentication failed",
         "permission denied (publickey)",
     ]
+    history_large_file_kw = [
+        "gh001: large files detected",
+        "exceeds github's file size limit",
+        "exceeds github's file size limit of 100.00 mb",
+    ]
     for attempt in range(1, retry_count + 1):
         logger.info(f"===== {operation} {redact_url(remote_url)} {branch} "
                     f"(尝试 {attempt}/{retry_count}) 间隔 {retry_seconds}s =====")
@@ -389,6 +442,12 @@ def run_network_retry(git_bin: str, cmd_args: list[str], operation: str, remote_
             if result.returncode == 0:
                 return result
             output = (result.stdout or "").lower()
+            if any(keyword in output for keyword in history_large_file_kw):
+                logger.error("❌ GitHub 拒绝了历史中的大文件，当前工作区扫描不到并不代表历史对象已清除。")
+                logger.error("请先执行 ./git.py list-big，确认 Blob；再执行 ./git.py remove-big，"
+                             "完成历史改写后使用 git push --force 推送。")
+                logger.error("如果希望保留这些文件，请先配置 Git LFS 并迁移历史，而不是只新增 .gitattributes。")
+                sys.exit(1)
             is_net = any(keyword in output for keyword in net_kw)
             is_auth = any(keyword in output for keyword in auth_kw)
             if is_net and not is_auth:
@@ -612,10 +671,38 @@ def git_push(git_bin: str, branch: str, repo_root: Path, extra_args: list[str],
     if run_shell(git_bin, ["add", "-A"]).returncode != 0:
         logger.error("git add 失败")
         sys.exit(1)
-    result = subprocess.run([git_bin, "status", "--porcelain"], capture_output=True, text=True)
+    if (repo_root / ".gitattributes").is_file():
+        if not renormalize_lfs(git_bin, repo_root):
+            sys.exit(1)
+        if run_shell(git_bin, ["add", "-A"]).returncode != 0:
+            logger.error("重新暂存 LFS 文件失败")
+            sys.exit(1)
+        if not verify_staged_lfs_files(git_bin, repo_root):
+            sys.exit(1)
+    status_result = subprocess.run([git_bin, "status", "--porcelain"], capture_output=True, text=True)
     changed_files = []
-    if result.returncode == 0 and result.stdout.strip():
-        changed_files = [line[3:].strip() for line in result.stdout.strip().split("\n") if line[3:].strip()]
+    if status_result.returncode == 0 and status_result.stdout.strip():
+        changed_files = [line[3:].strip() for line in status_result.stdout.strip().split("\n") if line[3:].strip()]
+    submodule_result = subprocess.run([git_bin, "ls-files", "--stage"], capture_output=True, text=True)
+    submodule_paths = {
+        line.split("\t", 1)[1].strip()
+        for line in submodule_result.stdout.splitlines()
+        if line.startswith("160000 ") and "\t" in line
+    }
+    staged_result = subprocess.run([git_bin, "diff", "--cached", "--name-only"], capture_output=True, text=True)
+    staged_files = []
+    if staged_result.returncode == 0 and staged_result.stdout.strip():
+        staged_files = [line.strip() for line in staged_result.stdout.splitlines() if line.strip()]
+    if not staged_files:
+        submodule_changes = [path for path in changed_files
+                             if path in submodule_paths or any(path.startswith(f"{item}/") for item in submodule_paths)]
+        if submodule_changes:
+            logger.warning("检测到子模块内部有未提交修改，但父仓库没有可提交的暂存内容: "
+                           f"{submodule_changes}")
+            logger.warning("请进入子模块单独提交，或在父仓库提交子模块更新后的 gitlink。")
+        changed_files = []
+    else:
+        changed_files = staged_files
     if not commit_msg:
         max_file, max_size = None, -1
         for rel in changed_files:
@@ -639,8 +726,10 @@ def git_push(git_bin: str, branch: str, repo_root: Path, extra_args: list[str],
                 with open(repo_root / "ReadMe.md", 'rb') as fh:
                     if b'#EmptyAfterPush' in fh.read():
                         EmptyAfterPush = True
-        if run_shell(git_bin, ["commit", "-m", commit_msg]).returncode != 0:
-            logger.error("git commit 失败")
+        commit_result = run_shell(git_bin, ["commit", "-m", commit_msg])
+        if commit_result.returncode != 0:
+            logger.error(f"git commit 失败，返回码: {commit_result.returncode}")
+            logger.error("请查看上方 Git 输出；可执行 git status 和 git diff --cached 进一步确认暂存内容。")
             sys.exit(1)
     else:
         logger.info("暂存区为空")
@@ -839,12 +928,11 @@ def main():
                 if not check_lfs_available(git_exe):
                     logger.critical("Git LFS 安装后仍不可用")
                     sys.exit(1)
-            if not is_lfs_initialized(repo_root):
-                if not init_lfs(git_exe):
-                    sys.exit(1)
-            else:
-                logger.info("LFS hooks 已初始化")
+            if not init_lfs(git_exe, repo_root):
+                sys.exit(1)
             clean_and_apply_lfs(git_exe, repo_root, large_files)
+            if not renormalize_lfs(git_exe, repo_root):
+                sys.exit(1)
         if remote_url:
             set_remote(git_exe, remote_url)
         if args.mode == "pull":
